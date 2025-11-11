@@ -1,9 +1,9 @@
 """QLoRA fine-tuning script for Llama 3.1 8B on GPU machine."""
 import json
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from dataclasses import dataclass
 import torch
-from datasets import Dataset
+from datasets import Dataset, DatasetDict
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
@@ -17,6 +17,7 @@ from ..database import get_db_session
 from ..db.schema import ContractCorrelation
 from ..config import get_settings
 from .prompt_builder import build_training_prompt
+import numpy as np
 
 
 @dataclass
@@ -70,6 +71,47 @@ def load_training_data(limit: int = None) -> List[Dict[str, Any]]:
 
     print(f"Loaded {len(training_data)} training examples")
     return training_data
+
+
+def split_data(
+    data: List[Dict[str, Any]],
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+    seed: int = 42
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Split data into train/val/test sets.
+
+    Args:
+        data: Full dataset
+        train_ratio: Proportion for training
+        val_ratio: Proportion for validation
+        test_ratio: Proportion for testing
+        seed: Random seed for reproducibility
+
+    Returns:
+        Tuple of (train_data, val_data, test_data)
+    """
+    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1"
+
+    np.random.seed(seed)
+    indices = np.random.permutation(len(data))
+
+    train_end = int(len(data) * train_ratio)
+    val_end = train_end + int(len(data) * val_ratio)
+
+    train_indices = indices[:train_end]
+    val_indices = indices[train_end:val_end]
+    test_indices = indices[val_end:]
+
+    train_data = [data[i] for i in train_indices]
+    val_data = [data[i] for i in val_indices]
+    test_data = [data[i] for i in test_indices]
+
+    print(f"Split: train={len(train_data)}, val={len(val_data)}, test={len(test_data)}")
+
+    return train_data, val_data, test_data
 
 
 def prepare_dataset(training_data: List[Dict[str, Any]], tokenizer) -> Dataset:
@@ -157,11 +199,16 @@ def train_model(config: TrainingConfig = None, data_limit: int = None):
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    # Load and prepare data
-    training_data = load_training_data(limit=data_limit)
-    dataset = prepare_dataset(training_data, tokenizer)
+    # Load and split data
+    all_data = load_training_data(limit=data_limit)
+    train_data, val_data, test_data = split_data(all_data)
 
-    # Tokenize dataset
+    # Prepare datasets
+    train_dataset = prepare_dataset(train_data, tokenizer)
+    val_dataset = prepare_dataset(val_data, tokenizer)
+    test_dataset = prepare_dataset(test_data, tokenizer)
+
+    # Tokenize datasets
     def tokenize_function(examples):
         """Tokenize examples."""
         result = tokenizer(
@@ -173,10 +220,20 @@ def train_model(config: TrainingConfig = None, data_limit: int = None):
         result["labels"] = result["input_ids"].copy()
         return result
 
-    tokenized_dataset = dataset.map(
+    tokenized_train = train_dataset.map(
         tokenize_function,
         batched=True,
-        remove_columns=dataset.column_names
+        remove_columns=train_dataset.column_names
+    )
+    tokenized_val = val_dataset.map(
+        tokenize_function,
+        batched=True,
+        remove_columns=val_dataset.column_names
+    )
+    tokenized_test = test_dataset.map(
+        tokenize_function,
+        batched=True,
+        remove_columns=test_dataset.column_names
     )
 
     # Training arguments
@@ -184,11 +241,17 @@ def train_model(config: TrainingConfig = None, data_limit: int = None):
         output_dir=config.output_dir,
         num_train_epochs=config.num_train_epochs,
         per_device_train_batch_size=config.per_device_train_batch_size,
+        per_device_eval_batch_size=config.per_device_train_batch_size,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         learning_rate=config.learning_rate,
         warmup_steps=config.warmup_steps,
         logging_steps=config.logging_steps,
         save_steps=config.save_steps,
+        eval_steps=config.save_steps,
+        evaluation_strategy="steps",
+        save_strategy="steps",
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
         fp16=True,
         optim="paged_adamw_8bit",
         save_total_limit=3,
@@ -199,20 +262,45 @@ def train_model(config: TrainingConfig = None, data_limit: int = None):
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=tokenized_dataset,
+        train_dataset=tokenized_train,
+        eval_dataset=tokenized_val,
         tokenizer=tokenizer
     )
 
     # Train
     print("Starting training...")
-    trainer.train()
+    train_result = trainer.train()
+
+    # Evaluate on validation set
+    print("\nEvaluating on validation set...")
+    val_metrics = trainer.evaluate(eval_dataset=tokenized_val)
+    print(f"Validation metrics: {val_metrics}")
+
+    # Evaluate on test set
+    print("\nEvaluating on test set...")
+    test_metrics = trainer.evaluate(eval_dataset=tokenized_test)
+    print(f"Test metrics: {test_metrics}")
 
     # Save final model
-    print(f"Saving model to {config.output_dir}")
+    print(f"\nSaving model to {config.output_dir}")
     trainer.save_model()
     tokenizer.save_pretrained(config.output_dir)
 
+    # Save metrics
+    import json
+    metrics_file = f"{config.output_dir}/metrics.json"
+    with open(metrics_file, 'w') as f:
+        json.dump({
+            "train": train_result.metrics,
+            "validation": val_metrics,
+            "test": test_metrics
+        }, f, indent=2)
+    print(f"Metrics saved to {metrics_file}")
+
+    print("\n" + "="*80)
     print("Training complete!")
+    print(f"Final test loss: {test_metrics.get('eval_loss', 'N/A'):.4f}")
+    print("="*80)
 
 
 if __name__ == "__main__":
