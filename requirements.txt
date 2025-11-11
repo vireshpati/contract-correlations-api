@@ -24,6 +24,9 @@ pytest
 pytest-asyncio
 httpx
 
+# Vector search
+faiss-gpu
+
 # Development
 ipykernel
 python-dotenv

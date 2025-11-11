@@ -1,6 +1,6 @@
-"""QLoRA fine-tuning script for Llama 3.1 8B on GPU machine."""
+"""QLoRA fine-tuning script for Llama 3.1 8B on GPU machine with hybrid loss."""
 import json
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from dataclasses import dataclass
 import torch
 from datasets import Dataset, DatasetDict
@@ -17,6 +17,11 @@ from ..database import get_db_session
 from ..db.schema import ContractCorrelation
 from ..config import get_settings
 from .prompt_builder import build_training_prompt
+from .training_utils import (
+    extract_correlation_from_labels,
+    extract_correlation_from_logits,
+    compute_regression_loss
+)
 import numpy as np
 
 
@@ -35,6 +40,78 @@ class TrainingConfig:
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
+    regression_loss_weight: float = 10.0  # Weight for MSE loss
+    regression_loss_type: str = "mse"  # "mse", "mae", or "huber"
+
+
+class RegressionAugmentedTrainer(Trainer):
+    """
+    Custom Trainer that adds regression loss on correlation predictions.
+
+    Combines standard generation loss with MSE loss on parsed correlation values.
+    """
+
+    def __init__(self, *args, regression_loss_weight=10.0, regression_loss_type="mse", **kwargs):
+        super().__init__(*args, **kwargs)
+        self.regression_loss_weight = regression_loss_weight
+        self.regression_loss_type = regression_loss_type
+
+    def compute_loss(self, model, inputs, return_outputs=False):
+        """
+        Compute hybrid loss: generation loss + weighted regression loss.
+
+        Args:
+            model: The model being trained
+            inputs: Dict with input_ids, attention_mask, labels
+            return_outputs: Whether to return model outputs
+
+        Returns:
+            Loss tensor (and optionally outputs)
+        """
+        # Standard forward pass for generation loss
+        outputs = model(**inputs)
+        generation_loss = outputs.loss
+
+        # Extract correlation values from labels (ground truth)
+        labels = inputs.get("labels")
+        if labels is None:
+            # No regression loss if no labels
+            return (generation_loss, outputs) if return_outputs else generation_loss
+
+        try:
+            true_correlations = extract_correlation_from_labels(labels, self.tokenizer)
+
+            # Extract predicted correlations from logits
+            logits = outputs.logits
+            attention_mask = inputs.get("attention_mask")
+            pred_correlations = extract_correlation_from_logits(
+                logits, self.tokenizer, attention_mask
+            )
+
+            # Compute regression loss
+            regression_loss = compute_regression_loss(
+                pred_correlations,
+                true_correlations,
+                loss_type=self.regression_loss_type
+            )
+
+            # Combined loss
+            total_loss = generation_loss + self.regression_loss_weight * regression_loss
+
+            # Log losses
+            if self.state.global_step % self.args.logging_steps == 0:
+                self.log({
+                    "generation_loss": generation_loss.item(),
+                    "regression_loss": regression_loss.item(),
+                    "total_loss": total_loss.item()
+                })
+
+        except Exception as e:
+            # If parsing fails, fall back to generation loss only
+            print(f"Warning: Regression loss computation failed: {e}")
+            total_loss = generation_loss
+
+        return (total_loss, outputs) if return_outputs else total_loss
 
 
 def load_training_data(limit: int = None) -> List[Dict[str, Any]]:
@@ -258,13 +335,15 @@ def train_model(config: TrainingConfig = None, data_limit: int = None):
         push_to_hub=False
     )
 
-    # Create trainer
-    trainer = Trainer(
+    # Create trainer with regression loss
+    trainer = RegressionAugmentedTrainer(
         model=model,
         args=training_args,
         train_dataset=tokenized_train,
         eval_dataset=tokenized_val,
-        tokenizer=tokenizer
+        tokenizer=tokenizer,
+        regression_loss_weight=config.regression_loss_weight,
+        regression_loss_type=config.regression_loss_type
     )
 
     # Train
