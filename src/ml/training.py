@@ -1,9 +1,7 @@
-"""QLoRA fine-tuning script for Llama 3.1 8B on GPU machine with hybrid loss."""
-import json
-from typing import List, Dict, Any, Tuple, Optional
-from dataclasses import dataclass
+"""QLoRA training with hybrid loss and RAG."""
 import torch
-from datasets import Dataset, DatasetDict
+import torch.nn.functional as F
+from torch.utils.data import Dataset
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
@@ -12,214 +10,270 @@ from transformers import (
     Trainer
 )
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from sqlalchemy import select
-from ..database import get_db_session
-from ..db.schema import ContractCorrelation
-from ..config import get_settings
-from .prompt_builder import build_training_prompt
-from .training_utils import (
-    extract_correlation_from_labels,
-    extract_correlation_from_logits,
-    compute_regression_loss
-)
-import numpy as np
+from dataclasses import dataclass
+from typing import Optional, List, Dict, Any
+import pandas as pd
+from sqlalchemy import text
+import json
+import re
+
+from src.config import get_settings
+from src.db.database import get_engine
+from src.ml.rag import SemanticRAG, embed_contracts
 
 
 @dataclass
 class TrainingConfig:
     """Training configuration."""
-    output_dir: str = "./models/llama-3.1-8b-correlation-qlora"
-    num_train_epochs: int = 3
+    output_dir: str = "./checkpoints"
+    num_train_epochs: int = 5
     per_device_train_batch_size: int = 4
+    per_device_eval_batch_size: int = 4
     gradient_accumulation_steps: int = 4
-    learning_rate: float = 2e-4
+    learning_rate: float = 1e-4
     warmup_steps: int = 100
     logging_steps: int = 10
+    eval_steps: int = 50
     save_steps: int = 100
-    max_seq_length: int = 2048
+    max_length: int = 1024
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
-    regression_loss_weight: float = 10.0  # Weight for MSE loss
-    regression_loss_type: str = "mse"  # "mse", "mae", or "huber"
+    correlation_loss_weight: float = 0.3  # Weight for MSE on correlation value
 
 
-class RegressionAugmentedTrainer(Trainer):
+def load_training_data(train_split: float = 0.7, val_split: float = 0.15) -> tuple[List[Dict], List[Dict], List[Dict]]:
     """
-    Custom Trainer that adds regression loss on correlation predictions.
-
-    Combines standard generation loss with MSE loss on parsed correlation values.
-    """
-
-    def __init__(self, *args, regression_loss_weight=10.0, regression_loss_type="mse", **kwargs):
-        super().__init__(*args, **kwargs)
-        self.regression_loss_weight = regression_loss_weight
-        self.regression_loss_type = regression_loss_type
-
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        """
-        Compute hybrid loss: generation loss + weighted regression loss.
-
-        Args:
-            model: The model being trained
-            inputs: Dict with input_ids, attention_mask, labels
-            return_outputs: Whether to return model outputs
-            num_items_in_batch: Number of items in batch (ignored, for API compatibility)
-
-        Returns:
-            Loss tensor (and optionally outputs)
-        """
-        # Standard forward pass for generation loss
-        outputs = model(**inputs)
-        generation_loss = outputs.loss
-
-        # Extract correlation values from labels (ground truth)
-        labels = inputs.get("labels")
-        if labels is None:
-            # No regression loss if no labels
-            return (generation_loss, outputs) if return_outputs else generation_loss
-
-        try:
-            true_correlations = extract_correlation_from_labels(labels, self.tokenizer)
-
-            # Extract predicted correlations from logits
-            logits = outputs.logits
-            attention_mask = inputs.get("attention_mask")
-            pred_correlations = extract_correlation_from_logits(
-                logits, self.tokenizer, attention_mask
-            )
-
-            # Compute regression loss
-            regression_loss = compute_regression_loss(
-                pred_correlations,
-                true_correlations,
-                loss_type=self.regression_loss_type
-            )
-
-            # Combined loss
-            total_loss = generation_loss + self.regression_loss_weight * regression_loss
-
-            # Log losses
-            if self.state.global_step % self.args.logging_steps == 0:
-                self.log({
-                    "generation_loss": generation_loss.item(),
-                    "regression_loss": regression_loss.item(),
-                    "total_loss": total_loss.item()
-                })
-
-        except Exception as e:
-            # If parsing fails, fall back to generation loss only
-            print(f"Warning: Regression loss computation failed: {e}")
-            total_loss = generation_loss
-
-        return (total_loss, outputs) if return_outputs else total_loss
-
-
-def load_training_data(limit: int = None) -> List[Dict[str, Any]]:
-    """
-    Load training data from contract_correlations table.
+    Load and split contract correlation data from database.
 
     Args:
-        limit: Optional limit on number of rows to load
-
-    Returns:
-        List of training examples
-    """
-    print("Loading training data from database...")
-
-    with get_db_session() as session:
-        query = select(ContractCorrelation).where(
-            ContractCorrelation.is_active == True
-        )
-        if limit:
-            query = query.limit(limit)
-
-        results = session.execute(query).scalars().all()
-
-        training_data = []
-        for row in results:
-            example = build_training_prompt(
-                contract_a_title=row.contract_a_title,
-                contract_b_title=row.contract_b_title,
-                target_correlation=row.underlying_event_correlation,
-                target_type=row.correlation_type,
-                target_reasoning=row.correlation_reasoning or "No reasoning provided"
-            )
-            training_data.append(example)
-
-    print(f"Loaded {len(training_data)} training examples")
-    return training_data
-
-
-def split_data(
-    data: List[Dict[str, Any]],
-    train_ratio: float = 0.7,
-    val_ratio: float = 0.15,
-    test_ratio: float = 0.15,
-    seed: int = 42
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """
-    Split data into train/val/test sets.
-
-    Args:
-        data: Full dataset
-        train_ratio: Proportion for training
-        val_ratio: Proportion for validation
-        test_ratio: Proportion for testing
-        seed: Random seed for reproducibility
+        train_split: Proportion for training (default 0.7)
+        val_split: Proportion for validation (default 0.15)
+        test_split will be 1 - train_split - val_split (default 0.15)
 
     Returns:
         Tuple of (train_data, val_data, test_data)
     """
-    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1"
+    settings = get_settings()
+    engine = get_engine()
 
-    np.random.seed(seed)
-    indices = np.random.permutation(len(data))
+    query = """
+    SELECT
+        contract_a_title,
+        contract_b_title,
+        underlying_event_correlation,
+        correlation_type,
+        correlation_reasoning,
+        analysis_confidence
+    FROM contract_correlations
+    WHERE is_active = true
+    ORDER BY created_at
+    """
 
-    train_end = int(len(data) * train_ratio)
-    val_end = train_end + int(len(data) * val_ratio)
+    with engine.connect() as conn:
+        df = pd.read_sql(text(query), conn)
 
-    train_indices = indices[:train_end]
-    val_indices = indices[train_end:val_end]
-    test_indices = indices[val_end:]
+    print(f"Loaded {len(df)} contract pairs from database")
 
-    train_data = [data[i] for i in train_indices]
-    val_data = [data[i] for i in val_indices]
-    test_data = [data[i] for i in test_indices]
+    # Create train/val/test splits
+    n = len(df)
+    train_end = int(n * train_split)
+    val_end = int(n * (train_split + val_split))
 
-    print(f"Split: train={len(train_data)}, val={len(val_data)}, test={len(test_data)}")
+    train_df = df[:train_end]
+    val_df = df[train_end:val_end]
+    test_df = df[val_end:]
+
+    print(f"Split sizes - Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
+
+    # Convert to message format
+    def row_to_example(row) -> Dict[str, Any]:
+        system_msg = """You are an expert at analyzing prediction market contracts and determining how their outcomes correlate.
+Analyze the two contracts and predict their correlation strength, type, and provide reasoning."""
+
+        user_msg = f"""Analyze these two prediction market contracts:
+
+Contract A: {row['contract_a_title']}
+Contract B: {row['contract_b_title']}
+
+Based on the contracts, provide a JSON response with:
+- underlying_correlation: float between -1.0 (perfect negative) and 1.0 (perfect positive)
+- correlation_type: "positive", "negative", or "neutral"
+- confidence: float between 0.0 and 1.0
+- reasoning: explanation of the correlation
+
+Respond with only the JSON object, no additional text."""
+
+        assistant_msg = json.dumps({
+            "underlying_correlation": float(row['underlying_event_correlation']),
+            "correlation_type": row['correlation_type'],
+            "confidence": float(row['analysis_confidence']),
+            "reasoning": row['correlation_reasoning']
+        })
+
+        return {
+            "messages": [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+                {"role": "assistant", "content": assistant_msg}
+            ],
+            "contract_a": row['contract_a_title'],
+            "contract_b": row['contract_b_title'],
+            "true_correlation": float(row['underlying_event_correlation'])
+        }
+
+    train_data = [row_to_example(row) for _, row in train_df.iterrows()]
+    val_data = [row_to_example(row) for _, row in val_df.iterrows()]
+    test_data = [row_to_example(row) for _, row in test_df.iterrows()]
 
     return train_data, val_data, test_data
 
 
-def prepare_dataset(training_data: List[Dict[str, Any]], tokenizer) -> Dataset:
-    """
-    Prepare dataset for training.
+class CorrelationDataset(Dataset):
+    """Dataset for contract correlation with RAG context."""
 
-    Args:
-        training_data: List of message dictionaries
-        tokenizer: HuggingFace tokenizer
+    def __init__(self, data: List[Dict], tokenizer, rag: Optional[SemanticRAG], model, max_length: int = 1024):
+        """
+        Initialize dataset.
 
-    Returns:
-        Formatted dataset
-    """
-    def format_example(example):
-        """Format example for training."""
-        messages = example["messages"]
-        text = tokenizer.apply_chat_template(
+        Args:
+            data: List of examples
+            tokenizer: Tokenizer
+            rag: RAG system for retrieving similar examples
+            model: Model for computing embeddings (needed for RAG)
+            max_length: Maximum sequence length
+        """
+        self.data = data
+        self.tokenizer = tokenizer
+        self.rag = rag
+        self.model = model
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        example = self.data[idx]
+        messages = example["messages"].copy()
+
+        # Add RAG context to user message if available
+        if self.rag is not None:
+            # Compute embedding for this pair
+            query_embedding = embed_contracts(
+                self.model,
+                self.tokenizer,
+                example["contract_a"],
+                example["contract_b"],
+                device="cuda" if torch.cuda.is_available() else "cpu"
+            )
+
+            # Get similar examples (k=3)
+            similar = self.rag.search(query_embedding, k=3)
+            rag_context = self.rag.format_rag_context(similar)
+
+            # Add RAG context to user message
+            messages[1]["content"] += f"\n\n{rag_context}\n"
+
+        # Apply chat template
+        text = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=False
         )
-        return {"text": text}
 
-    formatted_data = [format_example(ex) for ex in training_data]
-    return Dataset.from_list(formatted_data)
+        # Tokenize
+        encoding = self.tokenizer(
+            text,
+            truncation=True,
+            max_length=self.max_length,
+            padding="max_length",
+            return_tensors="pt"
+        )
+
+        return {
+            "input_ids": encoding["input_ids"].squeeze(),
+            "attention_mask": encoding["attention_mask"].squeeze(),
+            "labels": encoding["input_ids"].squeeze(),
+            "true_correlation": torch.tensor(example["true_correlation"], dtype=torch.float32)
+        }
 
 
-def train_model(config: TrainingConfig = None, data_limit: int = None):
+class HybridLossTrainer(Trainer):
+    """Custom trainer with hybrid loss: language modeling + correlation MSE."""
+
+    def __init__(self, correlation_loss_weight: float = 0.3, *args, **kwargs):
+        """
+        Initialize trainer with hybrid loss.
+
+        Args:
+            correlation_loss_weight: Weight for correlation MSE loss (0-1)
+        """
+        super().__init__(*args, **kwargs)
+        self.correlation_loss_weight = correlation_loss_weight
+
+    def compute_loss(self, model, inputs, return_outputs=False):
+        """
+        Compute hybrid loss: cross-entropy for generation + MSE for correlation value.
+
+        Args:
+            model: The model
+            inputs: Input batch
+            return_outputs: Whether to return model outputs
+
+        Returns:
+            Loss value (and optionally outputs)
+        """
+        true_correlation = inputs.pop("true_correlation")
+
+        # Standard language modeling loss
+        outputs = model(**inputs)
+        lm_loss = outputs.loss
+
+        # Extract predicted correlation from generated text
+        # Generate a short sequence to get the correlation prediction
+        with torch.no_grad():
+            generated = model.generate(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                max_new_tokens=256,
+                do_sample=False,
+                pad_token_id=self.tokenizer.pad_token_id
+            )
+
+            # Decode and extract correlation value
+            pred_correlations = []
+            for gen_seq in generated:
+                text = self.tokenizer.decode(gen_seq, skip_special_tokens=True)
+                # Try to extract correlation value from JSON
+                try:
+                    json_match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
+                    if json_match:
+                        pred_data = json.loads(json_match.group())
+                        pred_corr = pred_data.get("underlying_correlation", 0.0)
+                    else:
+                        pred_corr = 0.0
+                except:
+                    pred_corr = 0.0
+                pred_correlations.append(pred_corr)
+
+            pred_correlation_tensor = torch.tensor(
+                pred_correlations,
+                dtype=torch.float32,
+                device=true_correlation.device
+            )
+
+        # MSE loss on correlation values
+        mse_loss = F.mse_loss(pred_correlation_tensor, true_correlation)
+
+        # Combined loss
+        total_loss = (1 - self.correlation_loss_weight) * lm_loss + self.correlation_loss_weight * mse_loss
+
+        return (total_loss, outputs) if return_outputs else total_loss
+
+
+def train_model(config: Optional[TrainingConfig] = None, data_limit: Optional[int] = None):
     """
-    Train Llama 3.1 8B with QLoRA on contract correlations.
+    Train QLoRA model with hybrid loss and RAG.
 
     Args:
         config: Training configuration
@@ -229,160 +283,119 @@ def train_model(config: TrainingConfig = None, data_limit: int = None):
         config = TrainingConfig()
 
     settings = get_settings()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    print("Setting up QLoRA training...")
+    print("=" * 80)
+    print("Training Contract Correlation Model with QLoRA + RAG + Hybrid Loss")
+    print("=" * 80)
 
-    # Configure 4-bit quantization
+    # Load data with proper splits
+    print("\n1. Loading and splitting data...")
+    train_data, val_data, test_data = load_training_data()
+
+    if data_limit:
+        train_data = train_data[:data_limit]
+        val_data = val_data[:min(data_limit // 5, len(val_data))]
+
+    print(f"Final sizes - Train: {len(train_data)}, Val: {len(val_data)}, Test: {len(test_data)}")
+
+    # Load model and tokenizer
+    print("\n2. Loading base model with 4-bit quantization...")
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=torch.float16,
-        bnb_4bit_use_double_quant=True
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4"
     )
 
-    # Load model
-    print("Loading base model...")
+    tokenizer = AutoTokenizer.from_pretrained(
+        settings.model_name,
+        token=settings.hf_token,
+    )
+    tokenizer.pad_token = tokenizer.eos_token
+
     model = AutoModelForCausalLM.from_pretrained(
         settings.model_name,
         quantization_config=bnb_config,
         device_map="auto",
         token=settings.hf_token,
         torch_dtype=torch.float16,
-        cache_dir=settings.model_cache_dir
     )
 
-    # Prepare for k-bit training
+    # Prepare model for training
     model = prepare_model_for_kbit_training(model)
 
     # Configure LoRA
+    print("\n3. Configuring LoRA...")
     lora_config = LoraConfig(
         r=config.lora_r,
         lora_alpha=config.lora_alpha,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         lora_dropout=config.lora_dropout,
         bias="none",
         task_type="CAUSAL_LM"
     )
 
-    # Get PEFT model
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(
-        settings.model_name,
-        token=settings.hf_token,
-        cache_dir=settings.model_cache_dir
-    )
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
+    # Load RAG index
+    print("\n4. Loading RAG index...")
+    rag = None
+    try:
+        rag = SemanticRAG(index_path="./faiss_index")
+        rag.load()
+        print("RAG index loaded successfully - will use during training")
+    except Exception as e:
+        print(f"Warning: Could not load RAG index: {e}")
+        print("Training will proceed without RAG context")
 
-    # Load and split data
-    all_data = load_training_data(limit=data_limit)
-    train_data, val_data, test_data = split_data(all_data)
-
-    # Prepare datasets
-    train_dataset = prepare_dataset(train_data, tokenizer)
-    val_dataset = prepare_dataset(val_data, tokenizer)
-    test_dataset = prepare_dataset(test_data, tokenizer)
-
-    # Tokenize datasets
-    def tokenize_function(examples):
-        """Tokenize examples."""
-        result = tokenizer(
-            examples["text"],
-            truncation=True,
-            max_length=config.max_seq_length,
-            padding="max_length"
-        )
-        result["labels"] = result["input_ids"].copy()
-        return result
-
-    tokenized_train = train_dataset.map(
-        tokenize_function,
-        batched=True,
-        remove_columns=train_dataset.column_names
-    )
-    tokenized_val = val_dataset.map(
-        tokenize_function,
-        batched=True,
-        remove_columns=val_dataset.column_names
-    )
-    tokenized_test = test_dataset.map(
-        tokenize_function,
-        batched=True,
-        remove_columns=test_dataset.column_names
-    )
+    # Create datasets
+    print("\n5. Creating datasets with RAG context...")
+    train_dataset = CorrelationDataset(train_data, tokenizer, rag, model, config.max_length)
+    val_dataset = CorrelationDataset(val_data, tokenizer, rag, model, config.max_length)
 
     # Training arguments
     training_args = TrainingArguments(
         output_dir=config.output_dir,
         num_train_epochs=config.num_train_epochs,
         per_device_train_batch_size=config.per_device_train_batch_size,
-        per_device_eval_batch_size=config.per_device_train_batch_size,
+        per_device_eval_batch_size=config.per_device_eval_batch_size,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         learning_rate=config.learning_rate,
         warmup_steps=config.warmup_steps,
         logging_steps=config.logging_steps,
+        eval_steps=config.eval_steps,
         save_steps=config.save_steps,
-        eval_strategy="steps",  # Changed from evaluation_strategy
-        eval_steps=config.save_steps,
+        evaluation_strategy="steps",
         save_strategy="steps",
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         fp16=True,
         optim="paged_adamw_8bit",
-        save_total_limit=3,
-        push_to_hub=False
+        report_to="none"
     )
 
-    # Create trainer with regression loss
-    trainer = RegressionAugmentedTrainer(
+    # Create trainer with hybrid loss
+    print("\n6. Initializing trainer with hybrid loss...")
+    trainer = HybridLossTrainer(
+        correlation_loss_weight=config.correlation_loss_weight,
         model=model,
         args=training_args,
-        train_dataset=tokenized_train,
-        eval_dataset=tokenized_val,
-        tokenizer=tokenizer,
-        regression_loss_weight=config.regression_loss_weight,
-        regression_loss_type=config.regression_loss_type
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        tokenizer=tokenizer
     )
 
     # Train
-    print("Starting training...")
-    train_result = trainer.train()
-
-    # Evaluate on validation set
-    print("\nEvaluating on validation set...")
-    val_metrics = trainer.evaluate(eval_dataset=tokenized_val)
-    print(f"Validation metrics: {val_metrics}")
-
-    # Evaluate on test set
-    print("\nEvaluating on test set...")
-    test_metrics = trainer.evaluate(eval_dataset=tokenized_test)
-    print(f"Test metrics: {test_metrics}")
+    print("\n7. Starting training...")
+    trainer.train()
 
     # Save final model
-    print(f"\nSaving model to {config.output_dir}")
-    trainer.save_model()
-    tokenizer.save_pretrained(config.output_dir)
+    print("\n8. Saving final model...")
+    trainer.save_model(f"{config.output_dir}/final_model")
 
-    # Save metrics
-    import json
-    metrics_file = f"{config.output_dir}/metrics.json"
-    with open(metrics_file, 'w') as f:
-        json.dump({
-            "train": train_result.metrics,
-            "validation": val_metrics,
-            "test": test_metrics
-        }, f, indent=2)
-    print(f"Metrics saved to {metrics_file}")
-
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("Training complete!")
-    print(f"Final test loss: {test_metrics.get('eval_loss', 'N/A'):.4f}")
-    print("="*80)
-
-
-if __name__ == "__main__":
-    # Train with default config
-    train_model()
+    print(f"Model saved to: {config.output_dir}/final_model")
+    print("=" * 80)

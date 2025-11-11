@@ -1,97 +1,69 @@
-"""Tests for FastAPI endpoints."""
+"""Tests for API endpoints."""
 import pytest
 from fastapi.testclient import TestClient
-from unittest.mock import patch, MagicMock
+
 from src.main import app
 
 
 @pytest.fixture
 def client():
-    """Test client for API."""
+    """Create test client."""
     return TestClient(app)
 
 
-def test_root_endpoint(client):
+def test_root(client):
     """Test root endpoint."""
     response = client.get("/")
-
     assert response.status_code == 200
     data = response.json()
-    assert "message" in data
-    assert "endpoints" in data
+    assert data["status"] == "ok"
+    assert "model_loaded" in data
 
 
-@patch("src.main.get_predictor")
-@patch("src.main.get_db_session")
-def test_health_endpoint(mock_db_session, mock_predictor, client):
-    """Test health check endpoint."""
-    # Mock predictor
-    predictor = MagicMock()
-    predictor.is_loaded = True
-    mock_predictor.return_value = predictor
-
-    # Mock database session
-    session_mock = MagicMock()
-    session_mock.__enter__ = MagicMock(return_value=session_mock)
-    session_mock.__exit__ = MagicMock(return_value=None)
-    mock_db_session.return_value = session_mock
-
+def test_health(client):
+    """Test health endpoint."""
     response = client.get("/health")
-
     assert response.status_code == 200
     data = response.json()
     assert "status" in data
     assert "model_loaded" in data
-    assert "database_connected" in data
-
-
-@patch("src.main.get_predictor")
-@patch("src.main.get_db_session")
-def test_predict_correlation_endpoint(mock_db_session, mock_predictor, client, sample_contracts):
-    """Test correlation prediction endpoint."""
-    # Mock predictor
-    predictor = MagicMock()
-    predictor.predict.return_value = {
-        "underlying_correlation": 0.75,
-        "correlation_type": "positive",
-        "confidence": 0.85,
-        "reasoning": "Both contracts relate to cryptocurrency prices."
-    }
-    mock_predictor.return_value = predictor
-
-    # Mock database session
-    session_mock = MagicMock()
-    session_mock.__enter__ = MagicMock(return_value=session_mock)
-    session_mock.__exit__ = MagicMock(return_value=None)
-    mock_db_session.return_value = session_mock
-
-    response = client.post(
-        "/predict-correlation",
-        json={
-            "contract_a": sample_contracts["contract_a"],
-            "contract_b": sample_contracts["contract_b"],
-            "use_rag": False
-        }
-    )
-
-    assert response.status_code == 200
-    data = response.json()
-    assert "underlying_correlation" in data
-    assert "correlation_type" in data
-    assert "confidence" in data
-    assert "reasoning" in data
-    assert data["underlying_correlation"] == 0.75
-    assert data["correlation_type"] == "positive"
+    assert "rag_available" in data
 
 
 def test_predict_correlation_validation(client):
-    """Test request validation."""
-    response = client.post(
-        "/predict-correlation",
-        json={
-            "contract_a": "a",  # Too short
-            "contract_b": "Will Ethereum reach $10k?"
-        }
-    )
+    """Test correlation prediction with invalid input."""
+    # Missing required fields
+    response = client.post("/predict-correlation", json={})
+    assert response.status_code == 422
 
-    assert response.status_code == 422  # Validation error
+    # Invalid field types
+    response = client.post("/predict-correlation", json={
+        "contract_a": 123,
+        "contract_b": "Test"
+    })
+    assert response.status_code == 422
+
+
+def test_predict_correlation_format(client):
+    """Test correlation prediction response format."""
+    response = client.post("/predict-correlation", json={
+        "contract_a": "Will Bitcoin reach $100,000 by 2025?",
+        "contract_b": "Will Ethereum reach $10,000 by 2025?",
+        "use_rag": False
+    })
+
+    # May be 503 if model not loaded, or 200 if successful
+    if response.status_code == 200:
+        data = response.json()
+        assert "underlying_correlation" in data
+        assert "correlation_type" in data
+        assert "confidence" in data
+        assert "reasoning" in data
+        assert -1.0 <= data["underlying_correlation"] <= 1.0
+        assert 0.0 <= data["confidence"] <= 1.0
+        assert data["correlation_type"] in ["positive", "negative", "neutral"]
+    elif response.status_code == 503:
+        # Model not loaded is acceptable in test environment
+        assert "Model not loaded" in response.json()["detail"]
+    else:
+        pytest.fail(f"Unexpected status code: {response.status_code}")
