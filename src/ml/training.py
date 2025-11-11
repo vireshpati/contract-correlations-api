@@ -56,7 +56,7 @@ class RegressionAugmentedTrainer(Trainer):
         self.regression_loss_weight = regression_loss_weight
         self.regression_loss_type = regression_loss_type
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """
         Compute hybrid loss: generation loss + weighted regression loss.
 
@@ -64,6 +64,7 @@ class RegressionAugmentedTrainer(Trainer):
             model: The model being trained
             inputs: Dict with input_ids, attention_mask, labels
             return_outputs: Whether to return model outputs
+            num_items_in_batch: Number of items in batch (ignored, for API compatibility)
 
         Returns:
             Loss tensor (and optionally outputs)
