@@ -9,6 +9,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from src.ml.training import load_training_data, split_data
 from src.ml.inference import CorrelationPredictor
 from src.ml.prompt_builder import build_user_prompt
+from src.ml.rag import retrieve_context
+from src.database import get_db_session
 import numpy as np
 
 
@@ -56,13 +58,14 @@ def evaluate_predictions(predictions, ground_truth):
     }
 
 
-def run_evaluation(model_path: str = None, num_samples: int = None):
+def run_evaluation(model_path: str = None, num_samples: int = None, use_rag: bool = False):
     """
     Run evaluation on test set.
 
     Args:
         model_path: Path to trained model (None for base model)
         num_samples: Number of test samples to evaluate (None for all)
+        use_rag: Whether to use RAG context for predictions
     """
     print("=" * 80)
     print("Model Evaluation on Test Set")
@@ -91,14 +94,19 @@ def run_evaluation(model_path: str = None, num_samples: int = None):
     predictor.load_model()
 
     # Run predictions
-    print("\nRunning predictions...")
+    print(f"\nRunning predictions{'with RAG' if use_rag else ''}...")
+    print("Note: This may take 2-5 minutes for 113 examples (~2-3 sec/example)")
     predictions = []
     ground_truth = []
 
-    for i, example in enumerate(test_data):
-        if (i + 1) % 10 == 0:
-            print(f"  Progress: {i+1}/{len(test_data)}")
+    try:
+        from tqdm import tqdm
+        iterator = tqdm(enumerate(test_data), total=len(test_data), desc="Predicting")
+    except ImportError:
+        iterator = enumerate(test_data)
+        print("Install tqdm for progress bar: pip install tqdm")
 
+    for i, example in iterator:
         messages = example["messages"]
         user_msg = messages[1]["content"]
 
@@ -111,15 +119,30 @@ def run_evaluation(model_path: str = None, num_samples: int = None):
         assistant_msg = messages[2]["content"]
         gt_correlation = eval(assistant_msg)["underlying_correlation"]
 
+        # Get RAG context if enabled
+        rag_context = None
+        if use_rag:
+            try:
+                with get_db_session() as session:
+                    rag_context, _ = retrieve_context(session, contract_a, contract_b, top_k=5)
+            except Exception as e:
+                if not isinstance(iterator, enumerate):
+                    iterator.write(f"  Warning: RAG failed for example {i}: {e}")
+                else:
+                    print(f"  Warning: RAG failed for example {i}: {e}")
+
         # Predict
         try:
-            prediction = predictor.predict(contract_a, contract_b, rag_context=None)
+            prediction = predictor.predict(contract_a, contract_b, rag_context=rag_context)
             pred_correlation = prediction["underlying_correlation"]
 
             predictions.append(pred_correlation)
             ground_truth.append(gt_correlation)
         except Exception as e:
-            print(f"  Warning: Prediction failed for example {i}: {e}")
+            if not isinstance(iterator, enumerate):
+                iterator.write(f"  Warning: Prediction failed for example {i}: {e}")
+            else:
+                print(f"  Warning: Prediction failed for example {i}: {e}")
             continue
 
     # Calculate metrics
@@ -142,11 +165,12 @@ def run_evaluation(model_path: str = None, num_samples: int = None):
     print(f"  ±0.3: {metrics['accuracy_0.3']:.1%}")
 
     # Save results
-    results_file = "evaluation_results.json"
+    results_file = f"evaluation_results{'_rag' if use_rag else ''}.json"
     with open(results_file, 'w') as f:
         json.dump({
             "model_path": model_path or "base_model",
             "num_samples": len(predictions),
+            "use_rag": use_rag,
             "metrics": metrics,
             "predictions": predictions[:10],  # Save first 10
             "ground_truth": ground_truth[:10]
@@ -174,7 +198,12 @@ if __name__ == "__main__":
         default=None,
         help="Number of test samples (default: all)"
     )
+    parser.add_argument(
+        "--rag",
+        action="store_true",
+        help="Use RAG context for predictions"
+    )
 
     args = parser.parse_args()
 
-    run_evaluation(model_path=args.model, num_samples=args.samples)
+    run_evaluation(model_path=args.model, num_samples=args.samples, use_rag=args.rag)
