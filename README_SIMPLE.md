@@ -72,13 +72,18 @@ A FastAPI application that predicts correlation between prediction market contra
 uvicorn src.main:app --host 0.0.0.0 --port 8000
 ```
 
+**On first startup, the API will automatically:**
+1. Check if FAISS index exists
+2. If not, build it from the database (one-time setup)
+3. Load the model and RAG system
+4. Start serving requests
+
+No manual index building required!
+
 ### Training
 
 ```bash
-# First, build FAISS index for RAG
-python examples/build_faiss_index.py
-
-# Then train with hybrid loss
+# Train with hybrid loss + RAG
 python examples/train_model.py
 ```
 
