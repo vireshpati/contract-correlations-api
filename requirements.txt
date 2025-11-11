@@ -1,0 +1,29 @@
+# Core API
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+python-multipart
+
+# Database
+pandas
+psycopg2-binary
+sqlalchemy
+
+# ML & AI
+torch
+transformers
+peft
+bitsandbytes
+sentence-transformers
+accelerate
+datasets
+
+# Testing
+pytest
+pytest-asyncio
+httpx
+
+# Development
+ipykernel
+python-dotenv
