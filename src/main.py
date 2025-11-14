@@ -74,6 +74,7 @@ def build_faiss_index_from_db(index_path: str = "./faiss_index"):
     tokenizer = AutoTokenizer.from_pretrained(
         settings.model_name,
         token=settings.hf_token,
+        cache_dir=settings.model_cache_dir
     )
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -83,6 +84,7 @@ def build_faiss_index_from_db(index_path: str = "./faiss_index"):
         device_map="auto",
         token=settings.hf_token,
         torch_dtype=torch.float16,
+        cache_dir=settings.model_cache_dir
     )
     model.eval()
 

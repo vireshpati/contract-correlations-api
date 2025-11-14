@@ -1,5 +1,6 @@
 """Configuration."""
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Optional
 
 
 class Settings(BaseSettings):
@@ -15,6 +16,11 @@ class Settings(BaseSettings):
 
     # Model
     model_name: str = "meta-llama/Llama-3.1-8B-Instruct"
+    model_cache_dir: Optional[str] = None  # Set to custom path if disk space limited
+
+    # Index building
+    skip_index_build: bool = False  # Set to True to skip auto-building index on startup
+    index_path: str = "./faiss_index"
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=False)
 
